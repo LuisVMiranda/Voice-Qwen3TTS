@@ -19,6 +19,7 @@ A gradio demo for Qwen3 TTS models.
 
 import argparse
 import os
+import re
 import tempfile
 import wave
 from dataclasses import asdict
@@ -29,6 +30,10 @@ import numpy as np
 import torch
 
 from .. import Qwen3TTSModel, VoiceClonePromptItem
+
+
+LONG_TEXT_CHAR_THRESHOLD = 450
+CHUNK_JOIN_SILENCE_S = 0.12
 
 
 def _title_case_display(s: str) -> str:
@@ -303,7 +308,67 @@ def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
         raise ValueError(f"Unknown Qwen-TTS model type: {mt}")
 
 
-def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
+def _split_long_text(text: str, char_threshold: int = LONG_TEXT_CHAR_THRESHOLD) -> List[str]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return []
+
+    if len(normalized) <= char_threshold:
+        return [normalized]
+
+    chunks: List[str] = []
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", normalized) if p and p.strip()]
+    for paragraph in paragraphs or [normalized]:
+        if len(paragraph) <= char_threshold:
+            chunks.append(paragraph)
+            continue
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?。！？])\s+", paragraph) if s and s.strip()]
+        if not sentences:
+            sentences = [paragraph]
+
+        current = ""
+        for sentence in sentences:
+            candidate = sentence if not current else f"{current} {sentence}"
+            if len(candidate) <= char_threshold:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                if len(sentence) <= char_threshold:
+                    current = sentence
+                else:
+                    parts = [sentence[i : i + char_threshold] for i in range(0, len(sentence), char_threshold)]
+                    chunks.extend(parts[:-1])
+                    current = parts[-1]
+
+        if current:
+            chunks.append(current)
+
+    return chunks or [normalized]
+
+
+def _concat_wavs(wavs: List[np.ndarray], sr: int) -> np.ndarray:
+    if not wavs:
+        return np.zeros((1,), dtype=np.float32)
+    if len(wavs) == 1:
+        return np.asarray(wavs[0], dtype=np.float32)
+
+    silence = np.zeros((max(1, int(sr * CHUNK_JOIN_SILENCE_S)),), dtype=np.float32)
+    stitched: List[np.ndarray] = []
+    for i, wav in enumerate(wavs):
+        stitched.append(np.asarray(wav, dtype=np.float32))
+        if i < len(wavs) - 1:
+            stitched.append(silence)
+    return np.concatenate(stitched)
+
+
+def build_demo(
+    tts: Qwen3TTSModel,
+    ckpt: str,
+    gen_kwargs_default: Dict[str, Any],
+    runtime_warnings: Optional[List[str]] = None,
+) -> gr.Blocks:
     model_kind = _detect_model_kind(ckpt, tts)
 
     supported_langs_raw = None
@@ -421,6 +486,8 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
 **Model Type:** `{model_kind}`  
 """
         )
+        if runtime_warnings:
+            gr.Markdown("\n".join([f"> ⚠️ {w}" for w in runtime_warnings]))
 
         if model_kind == "custom_voice":
             gr.Markdown(
@@ -455,6 +522,11 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
                         info="Optional style cue. Keep it short.",
                     )
+                    auto_split_in = gr.Checkbox(
+                        label="Auto-split long text (自动分段长文本)",
+                        value=True,
+                        info=f"Recommended for text longer than {LONG_TEXT_CHAR_THRESHOLD} chars.",
+                    )
                     save_out_in = gr.Checkbox(
                         label="Save to outputs/ (salvar em outputs/)",
                         value=False,
@@ -471,7 +543,7 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str, save_out: bool, filename_prefix: str):
+            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str, auto_split: bool, save_out: bool, filename_prefix: str):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -480,14 +552,32 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     language = lang_map.get(lang_disp, "Auto")
                     speaker = spk_map.get(spk_disp, spk_disp)
                     kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_custom_voice(
-                        text=text.strip(),
-                        language=language,
-                        speaker=speaker,
-                        instruct=(instruct or "").strip() or None,
-                        **kwargs,
-                    )
+                    text_clean = text.strip()
+                    chunks = _split_long_text(text_clean)
+                    if len(chunks) > 1 and not auto_split:
+                        return None, (
+                            f"Text is long ({len(text_clean)} chars). Enable 'Auto-split long text' or split into smaller paragraphs/sentences first."
+                        )
+
+                    wav_chunks: List[np.ndarray] = []
+                    sr: Optional[int] = None
+                    to_generate = chunks if auto_split else [text_clean]
+                    for chunk in to_generate:
+                        wavs, chunk_sr = tts.generate_custom_voice(
+                            text=chunk,
+                            language=language,
+                            speaker=speaker,
+                            instruct=(instruct or "").strip() or None,
+                            **kwargs,
+                        )
+                        sr = chunk_sr if sr is None else sr
+                        wav_chunks.append(wavs[0])
+
+                    assert sr is not None
+                    merged_wav = _concat_wavs(wav_chunks, sr)
                     status = "Finished. (生成完成)"
+                    if auto_split and len(to_generate) > 1:
+                        status += f" Auto-split into {len(to_generate)} chunks."
                     if save_out:
                         out_dir = "outputs"
                         os.makedirs(out_dir, exist_ok=True)
@@ -498,15 +588,15 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         else:
                             name = f"{safe_speaker}.wav"
                         out_path = os.path.join(out_dir, name)
-                        _save_wav_file(out_path, wavs[0], sr)
+                        _save_wav_file(out_path, merged_wav, sr)
                         status = f"Finished. Saved WAV to {out_path}"
-                    return _wav_to_gradio_audio(wavs[0], sr), status
+                    return _wav_to_gradio_audio(merged_wav, sr), status
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
             btn.click(
                 run_instruct,
-                inputs=[text_in, lang_in, spk_in, instruct_in, save_out_in, prefix_in],
+                inputs=[text_in, lang_in, spk_in, instruct_in, auto_split_in, save_out_in, prefix_in],
                 outputs=[audio_out, err],
             )
 
@@ -530,12 +620,17 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         lines=3,
                         value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
                     )
+                    auto_split_in = gr.Checkbox(
+                        label="Auto-split long text (自动分段长文本)",
+                        value=True,
+                        info=f"Recommended for text longer than {LONG_TEXT_CHAR_THRESHOLD} chars.",
+                    )
                     btn = gr.Button("Generate (生成)", variant="primary")
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_voice_design(text: str, lang_disp: str, design: str):
+            def run_voice_design(text: str, lang_disp: str, design: str, auto_split: bool):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -543,17 +638,35 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         return None, "Voice design instruction is required (必须填写音色描述)."
                     language = lang_map.get(lang_disp, "Auto")
                     kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_voice_design(
-                        text=text.strip(),
-                        language=language,
-                        instruct=design.strip(),
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                    text_clean = text.strip()
+                    chunks = _split_long_text(text_clean)
+                    if len(chunks) > 1 and not auto_split:
+                        return None, (
+                            f"Text is long ({len(text_clean)} chars). Enable 'Auto-split long text' or split into smaller paragraphs/sentences first."
+                        )
+                    wav_chunks: List[np.ndarray] = []
+                    sr: Optional[int] = None
+                    to_generate = chunks if auto_split else [text_clean]
+                    for chunk in to_generate:
+                        wavs, chunk_sr = tts.generate_voice_design(
+                            text=chunk,
+                            language=language,
+                            instruct=design.strip(),
+                            **kwargs,
+                        )
+                        sr = chunk_sr if sr is None else sr
+                        wav_chunks.append(wavs[0])
+
+                    assert sr is not None
+                    merged_wav = _concat_wavs(wav_chunks, sr)
+                    status = "Finished. (生成完成)"
+                    if auto_split and len(to_generate) > 1:
+                        status += f" Auto-split into {len(to_generate)} chunks."
+                    return _wav_to_gradio_audio(merged_wav, sr), status
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
-            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in, auto_split_in], outputs=[audio_out, err])
 
         else:  # voice_clone for base
             with gr.Tabs():
@@ -585,13 +698,18 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                                 value="Auto",
                                 interactive=True,
                             )
+                            auto_split_in = gr.Checkbox(
+                                label="Auto-split long text (自动分段长文本)",
+                                value=True,
+                                info=f"Recommended for text longer than {LONG_TEXT_CHAR_THRESHOLD} chars.",
+                            )
                             btn = gr.Button("Generate (生成)", variant="primary")
 
                         with gr.Column(scale=3):
                             audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                             err = gr.Textbox(label="Status (状态)", lines=2)
 
-                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str):
+                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str, auto_split: bool):
                         try:
                             if not text or not text.strip():
                                 return None, "Target text is required (必须填写待合成文本)."
@@ -605,21 +723,39 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                                 )
                             language = lang_map.get(lang_disp, "Auto")
                             kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                            text_clean = text.strip()
+                            chunks = _split_long_text(text_clean)
+                            if len(chunks) > 1 and not auto_split:
+                                return None, (
+                                    f"Text is long ({len(text_clean)} chars). Enable 'Auto-split long text' or split into smaller paragraphs/sentences first."
+                                )
+                            wav_chunks: List[np.ndarray] = []
+                            sr: Optional[int] = None
+                            to_generate = chunks if auto_split else [text_clean]
+                            for chunk in to_generate:
+                                wavs, chunk_sr = tts.generate_voice_clone(
+                                    text=chunk,
+                                    language=language,
+                                    ref_audio=at,
+                                    ref_text=(ref_txt.strip() if ref_txt else None),
+                                    x_vector_only_mode=bool(use_xvec),
+                                    **kwargs,
+                                )
+                                sr = chunk_sr if sr is None else sr
+                                wav_chunks.append(wavs[0])
+
+                            assert sr is not None
+                            merged_wav = _concat_wavs(wav_chunks, sr)
+                            status = "Finished. (生成完成)"
+                            if auto_split and len(to_generate) > 1:
+                                status += f" Auto-split into {len(to_generate)} chunks."
+                            return _wav_to_gradio_audio(merged_wav, sr), status
                         except Exception as e:
                             return None, f"{type(e).__name__}: {e}"
 
                     btn.click(
                         run_voice_clone,
-                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in],
+                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in, auto_split_in],
                         outputs=[audio_out, err],
                     )
 
@@ -666,6 +802,11 @@ Upload a previously saved voice file, then synthesize new text.
                                 value="Auto",
                                 interactive=True,
                             )
+                            auto_split_in2 = gr.Checkbox(
+                                label="Auto-split long text (自动分段长文本)",
+                                value=True,
+                                info=f"Recommended for text longer than {LONG_TEXT_CHAR_THRESHOLD} chars.",
+                            )
                             gen_btn2 = gr.Button("Generate (生成)", variant="primary")
 
                         with gr.Column(scale=3):
@@ -697,7 +838,7 @@ Upload a previously saved voice file, then synthesize new text.
                         except Exception as e:
                             return None, f"{type(e).__name__}: {e}"
 
-                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
+                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str, auto_split: bool):
                         try:
                             if file_obj is None:
                                 return None, "Voice file is required (必须上传音色文件)."
@@ -738,13 +879,31 @@ Upload a previously saved voice file, then synthesize new text.
 
                             language = lang_map.get(lang_disp, "Auto")
                             kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                voice_clone_prompt=items,
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                            text_clean = text.strip()
+                            chunks = _split_long_text(text_clean)
+                            if len(chunks) > 1 and not auto_split:
+                                return None, (
+                                    f"Text is long ({len(text_clean)} chars). Enable 'Auto-split long text' or split into smaller paragraphs/sentences first."
+                                )
+                            wav_chunks: List[np.ndarray] = []
+                            sr: Optional[int] = None
+                            to_generate = chunks if auto_split else [text_clean]
+                            for chunk in to_generate:
+                                wavs, chunk_sr = tts.generate_voice_clone(
+                                    text=chunk,
+                                    language=language,
+                                    voice_clone_prompt=items,
+                                    **kwargs,
+                                )
+                                sr = chunk_sr if sr is None else sr
+                                wav_chunks.append(wavs[0])
+
+                            assert sr is not None
+                            merged_wav = _concat_wavs(wav_chunks, sr)
+                            status = "Finished. (生成完成)"
+                            if auto_split and len(to_generate) > 1:
+                                status += f" Auto-split into {len(to_generate)} chunks."
+                            return _wav_to_gradio_audio(merged_wav, sr), status
                         except Exception as e:
                             return None, (
                                 f"Failed to read or use voice file. Check file format/content.\n"
@@ -753,7 +912,7 @@ Upload a previously saved voice file, then synthesize new text.
                             )
 
                     save_btn.click(save_prompt, inputs=[ref_audio_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
-                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
+                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2, auto_split_in2], outputs=[audio_out2, err2])
 
         gr.Markdown(
             """

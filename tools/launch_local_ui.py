@@ -19,8 +19,18 @@ from qwen_tts import Qwen3TTSModel
 from qwen_tts.cli.demo import build_demo
 
 DEFAULT_CHECKPOINT = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+RAM_GUARDRAIL_GB = 24.0
 LOCAL_HOST = "127.0.0.1"
 START_PORT = 8000
+
+
+def _is_17b_checkpoint(checkpoint: str) -> bool:
+    return "1.7b" in (checkpoint or "").lower()
+
+
+def _is_06b_checkpoint(checkpoint: str) -> bool:
+    lowered = (checkpoint or "").lower()
+    return "0.6b" in lowered or "06b" in lowered
 
 
 def _detect_ram_gb() -> Optional[float]:
@@ -121,11 +131,29 @@ def main() -> int:
     threads = _set_thread_guardrails()
     print(f"Thread guardrails set: OMP_NUM_THREADS={threads}, MKL_NUM_THREADS={threads}, torch={threads}")
 
+    runtime_warnings = []
+    selected_checkpoint = args.checkpoint
+
+    if capabilities["ram_gb"] is not None and capabilities["ram_gb"] < RAM_GUARDRAIL_GB and not _is_06b_checkpoint(selected_checkpoint):
+        runtime_warnings.append(
+            f"Low system RAM detected ({capabilities['ram_gb']:.1f} GB < {RAM_GUARDRAIL_GB:.0f} GB). Forcing 0.6B checkpoint for stability."
+        )
+        selected_checkpoint = DEFAULT_CHECKPOINT
+        print(f"WARNING: {runtime_warnings[-1]}")
+
     use_cuda = args.device == "cuda" and capabilities["cuda_available"]
     if args.device == "cuda" and not capabilities["cuda_available"]:
         print("CUDA requested but unavailable; falling back to CPU.")
 
     device = "cuda:0" if use_cuda else "cpu"
+
+    if device == "cpu" and _is_17b_checkpoint(selected_checkpoint):
+        warning = (
+            "1.7B checkpoint on CPU can be extremely slow and may trigger memory pressure. "
+            "Prefer CUDA or the 0.6B checkpoint for better stability."
+        )
+        runtime_warnings.append(warning)
+        print(f"WARNING: {warning}")
 
     if args.dtype is not None:
         dtype_map = {
@@ -137,12 +165,12 @@ def main() -> int:
     else:
         dtype = torch.bfloat16 if use_cuda else torch.float32
 
-    if not _checkpoint_is_cached(args.checkpoint):
+    if not _checkpoint_is_cached(selected_checkpoint):
         print("Downloading weights…")
 
     print("Loading model…")
     tts = Qwen3TTSModel.from_pretrained(
-        args.checkpoint,
+        selected_checkpoint,
         device_map=device,
         dtype=dtype,
         attn_implementation="sdpa",
@@ -151,7 +179,7 @@ def main() -> int:
     port = _find_free_port(start_port=max(1, args.port), host=LOCAL_HOST)
     url = f"http://{LOCAL_HOST}:{port}"
 
-    demo = build_demo(tts, args.checkpoint, {"max_new_tokens": args.max_new_tokens})
+    demo = build_demo(tts, selected_checkpoint, {"max_new_tokens": args.max_new_tokens}, runtime_warnings=runtime_warnings)
 
     print(f"Ready at <{url}>")
 
