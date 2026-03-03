@@ -3,6 +3,8 @@
 ## Quick start
 Double-click `run.bat`.
 
+The launcher starts the local Gradio UI with CPU-safe defaults and attempts to auto-open your browser.
+
 ## First-run expectations
 On the first run, the launcher will set up everything automatically, which can take a while:
 
@@ -11,6 +13,20 @@ On the first run, the launcher will set up everything automatically, which can t
 - Downloads large model weights (this is usually the slowest step).
 
 Subsequent runs are much faster after these assets are cached.
+
+When the UI starts, the launcher prints a line like:
+
+- `Ready at http://127.0.0.1:8000`
+
+If port `8000` is already in use, it automatically picks the next free localhost port and prints the exact URL.
+
+## Logs
+
+Each `run.bat` session writes a timestamped log file to:
+
+- `logs/run_YYYYMMDD_HHMMSS.log`
+
+If the UI exits or the window closes after a failure, reopen `run.bat` from a terminal and inspect the latest file in `logs/`.
 
 ## Output location
 Generated outputs are written to:

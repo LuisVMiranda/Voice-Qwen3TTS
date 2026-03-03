@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import socket
 import threading
@@ -33,7 +34,34 @@ def _is_06b_checkpoint(checkpoint: str) -> bool:
     return "0.6b" in lowered or "06b" in lowered
 
 
+def _detect_ram_gb_windows() -> Optional[float]:
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    try:
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return None
+        return stat.ullTotalPhys / (1024 ** 3)
+    except (AttributeError, OSError):
+        return None
+
+
 def _detect_ram_gb() -> Optional[float]:
+    if os.name == "nt":
+        return _detect_ram_gb_windows()
+
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
         phys_pages = os.sysconf("SC_PHYS_PAGES")
@@ -118,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    print("Setting up…")
+    print("Setting up...")
     capabilities = _detect_runtime_capabilities()
     ram_display = f"{capabilities['ram_gb']:.1f} GB" if capabilities["ram_gb"] is not None else "unknown"
     print(
@@ -166,9 +194,9 @@ def main() -> int:
         dtype = torch.bfloat16 if use_cuda else torch.float32
 
     if not _checkpoint_is_cached(selected_checkpoint):
-        print("Downloading weights…")
+        print("Downloading weights...")
 
-    print("Loading model…")
+    print("Loading model...")
     tts = Qwen3TTSModel.from_pretrained(
         selected_checkpoint,
         device_map=device,
@@ -181,7 +209,7 @@ def main() -> int:
 
     demo = build_demo(tts, selected_checkpoint, {"max_new_tokens": args.max_new_tokens}, runtime_warnings=runtime_warnings)
 
-    print(f"Ready at <{url}>")
+    print(f"Ready at {url}")
 
     launch_kwargs: Dict[str, Any] = {
         "server_name": LOCAL_HOST,

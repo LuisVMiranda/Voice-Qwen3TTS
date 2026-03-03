@@ -103,12 +103,21 @@ if errorlevel 1 (
     echo [Qwen3-TTS] SoX already available.
 )
 
+if not exist "logs" mkdir "logs"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Date -Format 'yyyyMMdd_HHmmss'"`) do set "RUN_TS=%%I"
+if not defined RUN_TS set "RUN_TS=%DATE:/=%_%TIME::=%"
+set "LOGFILE=%CD%\logs\run_%RUN_TS%.log"
+
 echo [Qwen3-TTS] Launching local UI...
-.venv\Scripts\python.exe -m qwen_tts.cli.demo
-if errorlevel 1 (
-    echo [Qwen3-TTS] UI exited with an error.
-    goto :die
-)
+echo [Qwen3-TTS] Logging to: %LOGFILE%
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .venv\Scripts\python.exe tools\launch_local_ui.py %* 2>&1 | Tee-Object -FilePath '%LOGFILE%' }"
+set "UI_EXIT=%ERRORLEVEL%"
+echo [Qwen3-TTS] UI process exited with code !UI_EXIT!.
+echo [Qwen3-TTS] Review log: %LOGFILE%
+if not "!UI_EXIT!"=="0" echo [Qwen3-TTS] UI exited unexpectedly. See log for details.
+pause
+
+if not "!UI_EXIT!"=="0" exit /b !UI_EXIT!
 
 exit /b 0
 
