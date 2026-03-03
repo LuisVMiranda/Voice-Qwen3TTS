@@ -91,28 +91,31 @@ def build_parser() -> argparse.ArgumentParser:
     # Model loading / from_pretrained args
     parser.add_argument(
         "--device",
-        default="cuda:0",
-        help="Device for device_map, e.g. cpu, cuda, cuda:0 (default: cuda:0).",
+        default="cpu",
+        help="Device for device_map, e.g. cpu, cuda, cuda:0 (default: cpu).",
     )
     parser.add_argument(
         "--dtype",
-        default="bfloat16",
+        default=None,
         choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"],
-        help="Torch dtype for loading the model (default: bfloat16).",
+        help=(
+            "Torch dtype for loading the model "
+            "(default: float32 on cpu devices, bfloat16 otherwise)."
+        ),
     )
     parser.add_argument(
         "--flash-attn/--no-flash-attn",
         dest="flash_attn",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
-        help="Enable FlashAttention-2 (default: enabled).",
+        help="Enable FlashAttention-2 (default: disabled).",
     )
 
     # Gradio server args
     parser.add_argument(
         "--ip",
-        default="0.0.0.0",
-        help="Server bind IP for Gradio (default: 0.0.0.0).",
+        default="127.0.0.1",
+        help="Server bind IP for Gradio (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--port",
@@ -130,8 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=16,
-        help="Gradio queue concurrency (default: 16).",
+        default=1,
+        help="Gradio queue concurrency (default: 1).",
     )
 
     # HTTPS args
@@ -602,7 +605,11 @@ def main(argv=None) -> int:
 
     ckpt = _resolve_checkpoint(args)
 
-    dtype = _dtype_from_str(args.dtype)
+    if args.dtype:
+        dtype = _dtype_from_str(args.dtype)
+    else:
+        is_cpu_device = str(args.device).strip().lower().startswith("cpu")
+        dtype = torch.float32 if is_cpu_device else torch.bfloat16
     attn_impl = "flash_attention_2" if args.flash_attn else None
 
     tts = Qwen3TTSModel.from_pretrained(
