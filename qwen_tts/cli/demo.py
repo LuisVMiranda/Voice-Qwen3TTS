@@ -20,6 +20,7 @@ A gradio demo for Qwen3 TTS models.
 import argparse
 import os
 import tempfile
+import wave
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +43,43 @@ def _build_choices_and_map(items: Optional[List[str]]) -> Tuple[List[str], Dict[
     display = [_title_case_display(x) for x in items]
     mapping = {d: r for d, r in zip(display, items)}
     return display, mapping
+
+
+def _ordered_language_choices(items: Optional[List[str]]) -> List[str]:
+    preferred = ["auto", "english", "portuguese"]
+    ordered = []
+    seen = set()
+    values = [x for x in (items or []) if x]
+
+    for key in preferred:
+        for item in values:
+            if item.lower() == key and item not in seen:
+                ordered.append(item)
+                seen.add(item)
+
+    for item in values:
+        if item not in seen:
+            ordered.append(item)
+
+    return ordered
+
+
+def _pick_default_speaker(items: Optional[List[str]]) -> Optional[str]:
+    if not items:
+        return None
+
+    preferred = ["ryan", "aiden"]
+    for key in preferred:
+        for item in items:
+            if item.lower() == key:
+                return item
+
+    for item in items:
+        lowered = item.lower()
+        if "en" in lowered or "english" in lowered:
+            return item
+
+    return items[0]
 
 
 def _dtype_from_str(s: str) -> torch.dtype:
@@ -246,6 +284,17 @@ def _wav_to_gradio_audio(wav: np.ndarray, sr: int) -> Tuple[int, np.ndarray]:
     return sr, wav
 
 
+def _save_wav_file(path: str, wav: np.ndarray, sr: int) -> None:
+    audio = np.asarray(wav, dtype=np.float32)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(int(sr))
+        f.writeframes(pcm.tobytes())
+
+
 def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
     mt = getattr(tts.model, "tts_model_type", None)
     if mt in ("custom_voice", "voice_design", "base"):
@@ -265,8 +314,11 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
     if callable(getattr(tts.model, "get_supported_speakers", None)):
         supported_spks_raw = tts.model.get_supported_speakers()
 
-    lang_choices_disp, lang_map = _build_choices_and_map([x for x in (supported_langs_raw or [])])
+    ordered_langs = _ordered_language_choices([x for x in (supported_langs_raw or [])])
+    lang_choices_disp, lang_map = _build_choices_and_map(ordered_langs)
     spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
+    default_speaker_raw = _pick_default_speaker([x for x in (supported_spks_raw or [])])
+    default_speaker_disp = _title_case_display(default_speaker_raw) if default_speaker_raw else None
 
     def _gen_common_kwargs() -> Dict[str, Any]:
         return dict(gen_kwargs_default)
@@ -371,37 +423,55 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
         )
 
         if model_kind == "custom_voice":
+            gr.Markdown(
+                "> ⚠️ **Local-only. Do not use voice cloning for impersonation.**"
+            )
             with gr.Row():
                 with gr.Column(scale=2):
                     text_in = gr.Textbox(
                         label="Text (待合成文本)",
                         lines=4,
                         placeholder="Enter text to synthesize (输入要合成的文本).",
+                        info="Short text works best. PT-BR and English supported.",
                     )
                     with gr.Row():
                         lang_in = gr.Dropdown(
                             label="Language (语种)",
                             choices=lang_choices_disp,
-                            value="Auto",
+                            value=("Auto" if "Auto" in lang_choices_disp else (lang_choices_disp[0] if lang_choices_disp else None)),
                             interactive=True,
+                            info="Use Auto unless language is mixed.",
                         )
                         spk_in = gr.Dropdown(
                             label="Speaker (说话人)",
                             choices=spk_choices_disp,
-                            value="Vivian",
+                            value=(default_speaker_disp if default_speaker_disp in spk_choices_disp else (spk_choices_disp[0] if spk_choices_disp else None)),
                             interactive=True,
+                            info="Ryan/Aiden are good defaults for English.",
                         )
                     instruct_in = gr.Textbox(
                         label="Instruction (Optional) (控制指令，可不输入)",
                         lines=2,
                         placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
+                        info="Optional style cue. Keep it short.",
+                    )
+                    save_out_in = gr.Checkbox(
+                        label="Save to outputs/ (salvar em outputs/)",
+                        value=False,
+                        info="Writes a WAV copy after generation.",
+                    )
+                    prefix_in = gr.Textbox(
+                        label="Filename prefix (optional)",
+                        lines=1,
+                        placeholder="ex: en_ptbr_demo",
+                        info="Used as outputs/<prefix>_<speaker>.wav",
                     )
                     btn = gr.Button("Generate (生成)", variant="primary")
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
+            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str, save_out: bool, filename_prefix: str):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -417,11 +487,28 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         instruct=(instruct or "").strip() or None,
                         **kwargs,
                     )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                    status = "Finished. (生成完成)"
+                    if save_out:
+                        out_dir = "outputs"
+                        os.makedirs(out_dir, exist_ok=True)
+                        safe_prefix = (filename_prefix or "").strip().replace(" ", "_")
+                        safe_speaker = (speaker or "speaker").strip().replace(" ", "_")
+                        if safe_prefix:
+                            name = f"{safe_prefix}_{safe_speaker}.wav"
+                        else:
+                            name = f"{safe_speaker}.wav"
+                        out_path = os.path.join(out_dir, name)
+                        _save_wav_file(out_path, wavs[0], sr)
+                        status = f"Finished. Saved WAV to {out_path}"
+                    return _wav_to_gradio_audio(wavs[0], sr), status
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
-            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+            btn.click(
+                run_instruct,
+                inputs=[text_in, lang_in, spk_in, instruct_in, save_out_in, prefix_in],
+                outputs=[audio_out, err],
+            )
 
         elif model_kind == "voice_design":
             with gr.Row():
