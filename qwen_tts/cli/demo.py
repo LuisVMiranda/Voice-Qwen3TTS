@@ -271,11 +271,95 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
     def _gen_common_kwargs() -> Dict[str, Any]:
         return dict(gen_kwargs_default)
 
-    theme = gr.themes.Soft(
+    theme = gr.themes.Base(
         font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],
+        primary_hue=gr.themes.colors.blue,
+        neutral_hue=gr.themes.colors.slate,
+    ).set(
+        body_background_fill="#0b1220",
+        body_text_color="#e2e8f0",
+        background_fill_primary="#111827",
+        background_fill_secondary="#1f2937",
+        block_background_fill="#111827",
+        block_border_color="#334155",
+        block_label_text_color="#e2e8f0",
+        input_background_fill="#1f2937",
+        input_border_color="#475569",
+        input_placeholder_color="#94a3b8",
+        button_primary_background_fill="#2563eb",
+        button_primary_background_fill_hover="#1d4ed8",
+        button_primary_text_color="#f8fafc",
     )
 
-    css = ".gradio-container {max-width: none !important;}"
+    css = """
+    .gradio-container {
+        max-width: 960px !important;
+        margin: 0 auto !important;
+        background: #0b1220 !important;
+        color: #e2e8f0 !important;
+    }
+    .gradio-container .wrap,
+    .gradio-container .contain,
+    .gradio-container .block,
+    .gradio-container .panel,
+    .gradio-container .form,
+    .gradio-container .prose,
+    .gradio-container .gr-form,
+    .gradio-container .gr-box,
+    .gradio-container .gr-group,
+    .gradio-container .gr-panel,
+    .gradio-container .gradio-markdown,
+    .gradio-container .gradio-audio,
+    .gradio-container .gradio-textbox,
+    .gradio-container .gradio-dropdown,
+    .gradio-container .gradio-file,
+    .gradio-container .gradio-checkbox {
+        background: #111827 !important;
+        color: #e2e8f0 !important;
+        border-color: #334155 !important;
+    }
+    .gradio-container label,
+    .gradio-container p,
+    .gradio-container span,
+    .gradio-container h1,
+    .gradio-container h2,
+    .gradio-container h3,
+    .gradio-container h4,
+    .gradio-container h5,
+    .gradio-container h6,
+    .gradio-container .prose * {
+        color: #e2e8f0 !important;
+    }
+    .gradio-container input,
+    .gradio-container textarea,
+    .gradio-container select,
+    .gradio-container option {
+        background: #1f2937 !important;
+        color: #e2e8f0 !important;
+        border-color: #475569 !important;
+    }
+    .gradio-container button {
+        background: #2563eb !important;
+        color: #f8fafc !important;
+        border-color: #1d4ed8 !important;
+    }
+    .gradio-container button:hover {
+        background: #1d4ed8 !important;
+    }
+    .gradio-container [role="alert"],
+    .gradio-container .warning,
+    .gradio-container .gradio-warning,
+    .gradio-container .gr-alert {
+        background: #7c2d12 !important;
+        color: #ffedd5 !important;
+        border-color: #ea580c !important;
+    }
+    .gradio-container .theme-toggle,
+    .gradio-container button[aria-label*="theme" i],
+    .gradio-container button[title*="theme" i] {
+        display: none !important;
+    }
+    """
 
     with gr.Blocks(theme=theme, css=css) as demo:
         gr.Markdown(
